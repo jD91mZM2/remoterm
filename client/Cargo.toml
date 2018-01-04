@@ -1,0 +1,8 @@
+[package]
+authors = ["jD91mZM2 <me@krake.one>"]
+name = "client"
+version = "0.1.0"
+[dependencies]
+failure = "0.1.1"
+openssl = "0.9.23"
+termion = "1.5.1"
