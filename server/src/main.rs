@@ -6,7 +6,7 @@ extern crate termion;
 
 use failure::Error;
 use openssl::pkcs12::Pkcs12;
-use openssl::ssl::{SslAcceptor, SslAcceptorBuilder, SslMethod, SslStream};
+use openssl::ssl::{SslAcceptor, SslMethod, SslStream};
 use pty::fork::{Fork as PtyFork, Master as PtyMaster};
 use rand::{OsRng, Rng};
 use std::borrow::Cow;
@@ -68,22 +68,39 @@ fn main() {
         return;
     }
 
-    let pkcs12 = match Pkcs12::from_der(&contents).and_then(|pkcs12| pkcs12.parse(password.trim())) {
-        Ok(pkcs12) => pkcs12,
+    let identity = match Pkcs12::from_der(&contents).and_then(|identity| identity.parse(password.trim())) {
+        Ok(identity) => identity,
         Err(err) => {
             eprintln!("failed to open pkcs12 archive: {}", err);
             return;
         }
     };
 
-    let ssl = SslAcceptorBuilder::mozilla_intermediate(
-        SslMethod::tls(),
-        &pkcs12.pkey,
-        &pkcs12.cert,
-        &pkcs12.chain
-    );
+    let hash = {
+        use std::fmt::Write;
+
+        let hash = openssl::sha::sha256(&identity.pkey.public_key_to_pem().unwrap());
+        let mut hash_str = String::with_capacity(64);
+        for byte in &hash {
+            write!(hash_str, "{:02X}", byte).unwrap();
+        }
+        hash_str
+    };
+    let ssl = SslAcceptor::mozilla_intermediate(SslMethod::tls())
+        .and_then(|mut ssl| ssl.set_private_key(&identity.pkey).map(|_| ssl))
+        .and_then(|mut ssl| ssl.set_certificate(&identity.cert).map(|_| ssl))
+        .and_then(|mut ssl| {
+            let mut result = Ok(());
+            if let Some(chains) = identity.chain {
+                for chain in chains {
+                    result = result.and_then(|_| ssl.add_extra_chain_cert(chain));
+                }
+            }
+            result.map(|_| ssl)
+        })
+        .map(|ssl| ssl.build());
     let ssl = match ssl {
-        Ok(ssl)  => ssl.build(),
+        Ok(ssl)  => ssl,
         Err(err) => {
             eprintln!("failed to build ssl acceptor: {}", err);
             return;
@@ -98,16 +115,6 @@ fn main() {
         }
     };
 
-    let hash = {
-        use std::fmt::Write;
-
-        let hash = openssl::sha::sha256(&pkcs12.pkey.public_key_to_pem().unwrap());
-        let mut hash_str = String::with_capacity(64);
-        for byte in &hash {
-            write!(hash_str, "{:02X}", byte).unwrap();
-        }
-        hash_str
-    };
     let mut rand = match OsRng::new() {
         Ok(rand) => rand,
         Err(err) => {

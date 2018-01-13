@@ -4,9 +4,9 @@ name = "server"
 version = "0.1.0"
 [dependencies]
 failure = "0.1.1"
-openssl = "0.9.23"
+openssl = "0.10.2"
 pty = "0.2.2"
-rand = "0.4.1"
+rand = "0.4.2"
 termion = "1.5.1"
 
 [features]
