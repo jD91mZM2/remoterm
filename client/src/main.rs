@@ -1,9 +1,10 @@
 #[macro_use] extern crate failure;
 extern crate openssl;
+extern crate sslhash;
 extern crate termion;
 
 use failure::Error;
-use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+use openssl::ssl::{SslConnector, SslMethod};
 use std::io::prelude::*;
 use std::io::{self, ErrorKind as IoErrorKind};
 use std::net::{SocketAddr, TcpStream};
@@ -52,32 +53,10 @@ fn inner_main() -> Result<(), Error> {
         return Err(InvalidPassword.into());
     }
 
-    let mut builder = SslConnector::builder(SslMethod::tls())?;
-    builder.set_verify_callback(SslVerifyMode::PEER, move |_, cert| {
-        use std::fmt::Write;
-
-        if let Some(cert) = cert.current_cert() {
-            if let Ok(pkey) = cert.public_key() {
-                if let Ok(pem) = pkey.public_key_to_pem() {
-                    let digest = openssl::sha::sha256(&pem);
-                    let mut digest_string = String::with_capacity(digest.len());
-                    for byte in &digest {
-                        write!(digest_string, "{:02X}", byte).unwrap();
-                    }
-                    return hash.trim().eq_ignore_ascii_case(&digest_string);
-                }
-            }
-        }
-        false
-    });
-    let ssl = builder.build();
+    let ssl = SslConnector::builder(SslMethod::tls())?.build();
 
     let stream = TcpStream::connect(addr)?;
-
-    let mut stream = ssl.configure()?
-                        .use_server_name_indication(false)
-                        .verify_hostname(false)
-                        .connect("", stream)?;
+    let mut stream = sslhash::connect(&ssl, stream, hash)?;
 
     stream.write_all(password.as_bytes())?;
     stream.flush()?;

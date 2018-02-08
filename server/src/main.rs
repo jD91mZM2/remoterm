@@ -2,16 +2,16 @@ extern crate failure;
 extern crate openssl;
 extern crate pty;
 extern crate rand;
+extern crate sslhash;
 extern crate termion;
 
 use failure::Error;
-use openssl::pkcs12::Pkcs12;
-use openssl::ssl::{SslAcceptor, SslMethod, SslStream};
+use openssl::ssl::{SslAcceptor, SslStream};
 use pty::fork::{Fork as PtyFork, Master as PtyMaster};
 use rand::{OsRng, Rng};
+use sslhash::AcceptorBuilder;
 use std::borrow::Cow;
 use std::env;
-use std::fs::File;
 use std::io::prelude::*;
 use std::io::{self, ErrorKind as IoErrorKind};
 use std::net::{TcpListener, TcpStream};
@@ -46,61 +46,8 @@ fn main() {
     };
     println!("Using shell: {}", shell);
 
-    let mut file = match File::open("cert.pfx") {
-        Ok(file) => file,
-        Err(err) => {
-            eprintln!("failed to open identity file: {}", err);
-            return;
-        }
-    };
-    let mut contents = Vec::new();
-    if let Err(err) = file.read_to_end(&mut contents) {
-        eprintln!("failed to read file: {}", err);
-        return;
-    }
-
-    print!("Pkcs12 password: ");
-    io::stdout().flush().unwrap();
-
-    let mut password = String::new();
-    if let Err(err) = io::stdin().read_line(&mut password) {
-        eprintln!("failed to read line: {}", err);
-        return;
-    }
-
-    let identity = match Pkcs12::from_der(&contents).and_then(|identity| identity.parse(password.trim())) {
-        Ok(identity) => identity,
-        Err(err) => {
-            eprintln!("failed to open pkcs12 archive: {}", err);
-            return;
-        }
-    };
-
-    let hash = {
-        use std::fmt::Write;
-
-        let hash = openssl::sha::sha256(&identity.pkey.public_key_to_pem().unwrap());
-        let mut hash_str = String::with_capacity(64);
-        for byte in &hash {
-            write!(hash_str, "{:02X}", byte).unwrap();
-        }
-        hash_str
-    };
-    let ssl = SslAcceptor::mozilla_intermediate(SslMethod::tls())
-        .and_then(|mut ssl| ssl.set_private_key(&identity.pkey).map(|_| ssl))
-        .and_then(|mut ssl| ssl.set_certificate(&identity.cert).map(|_| ssl))
-        .and_then(|mut ssl| {
-            let mut result = Ok(());
-            if let Some(chains) = identity.chain {
-                for chain in chains {
-                    result = result.and_then(|_| ssl.add_extra_chain_cert(chain));
-                }
-            }
-            result.map(|_| ssl)
-        })
-        .map(|ssl| ssl.build());
-    let ssl = match ssl {
-        Ok(ssl)  => ssl,
+    let (ssl, hash) = match AcceptorBuilder::default().build() {
+        Ok(result)  => result,
         Err(err) => {
             eprintln!("failed to build ssl acceptor: {}", err);
             return;
