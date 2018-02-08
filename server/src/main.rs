@@ -27,6 +27,7 @@ const PORT: u16  = 53202;
 
 const BUFSIZE: usize = 512;
 const PASSLEN: usize = 32;
+const DELAY:   usize = 5;
 
 fn main() {
     let port = env::args().skip(1).next().map(|arg| arg.parse().unwrap_or_else(|_| {
@@ -155,7 +156,7 @@ fn main_loop(mut master: PtyMaster, stream: SslStream<TcpStream>) -> Result<(), 
         stdout.lock();
 
         loop {
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(DELAY));
 
             let mut buf = [0; BUFSIZE];
             let read = master_clone.read(&mut buf)?;
@@ -172,7 +173,7 @@ fn main_loop(mut master: PtyMaster, stream: SslStream<TcpStream>) -> Result<(), 
     let mut stdin = termion::async_stdin();
 
     loop {
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(DELAY));
 
         let mut stream = stream.lock().unwrap();
 

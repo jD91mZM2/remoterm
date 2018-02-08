@@ -16,4 +16,3 @@ This is **not** a perfect application. Don't expect it to be one.
 Known flaws:
  - Client does not close until you try to send a message (which will fail).
  - Ctrl+C on the server lets fork leak.
- - Slow.

@@ -20,6 +20,7 @@ const PORT: u16 = 53202;
 
 const BUFSIZE: usize = 512;
 const PASSLEN: usize = 32;
+const DELAY:   usize = 5;
 
 fn main() {
     if let Err(err) = inner_main() {
@@ -32,7 +33,7 @@ fn inner_main() -> Result<(), Error> {
     let mut addr = String::new();
     io::stdin().read_line(&mut addr)?;
 
-    let addr = match parse_addr(&addr) {
+    let addr = match parse_addr(&addr.trim()) {
         Some(addr) => addr,
         None => {
             eprintln!("invalid address");
@@ -69,7 +70,7 @@ fn inner_main() -> Result<(), Error> {
     let mut stdin = termion::async_stdin();
 
     loop {
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(DELAY));
 
         let mut buf = [0; BUFSIZE];
         let read = match stream.read(&mut buf) {
