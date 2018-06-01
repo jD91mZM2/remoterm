@@ -8,7 +8,10 @@ extern crate termion;
 
 use failure::Error;
 use mio::{*, unix::EventedFd};
-use nix::pty::{openpty, Winsize};
+use nix::{
+    unistd::setsid,
+    pty::{openpty, Winsize}
+};
 use openssl::ssl::{SslAcceptor, SslStream};
 use rand::{OsRng, Rng};
 use sslhash::AcceptorBuilder;
@@ -22,7 +25,10 @@ use std::{
         ErrorKind as IoErrorKind
     },
     net::{TcpListener, TcpStream},
-    os::unix::io::{AsRawFd, FromRawFd},
+    os::unix::{
+        io::{AsRawFd, FromRawFd},
+        process::CommandExt
+    },
     process::{Command, Stdio}
 };
 use termion::raw::IntoRawMode;
@@ -110,6 +116,10 @@ fn main() {
             .stdin(unsafe { Stdio::from_raw_fd(pty.slave) })
             .stdout(unsafe { Stdio::from_raw_fd(pty.slave) })
             .stderr(unsafe { Stdio::from_raw_fd(pty.slave) })
+            .before_exec(|| {
+                setsid().expect("failed to setsid");
+                Ok(())
+            })
             .spawn() {
         eprintln!("failed to spawn process: {}", err);
     }
