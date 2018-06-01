@@ -7,10 +7,15 @@ extern crate termion;
 use failure::Error;
 use mio::{*, unix::EventedFd};
 use openssl::ssl::{SslConnector, SslMethod};
-use std::io::prelude::*;
-use std::io::{self, ErrorKind as IoErrorKind};
-use std::net::{SocketAddr, TcpStream};
-use std::os::unix::io::AsRawFd;
+use std::{
+    io::{
+        self,
+        prelude::*,
+        ErrorKind as IoErrorKind
+    },
+    net::{SocketAddr, TcpStream},
+    os::unix::io::AsRawFd
+};
 use termion::raw::IntoRawMode;
 
 #[derive(Debug, Fail)]

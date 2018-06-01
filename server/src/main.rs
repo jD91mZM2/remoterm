@@ -12,13 +12,18 @@ use openssl::ssl::{SslAcceptor, SslStream};
 use pty::fork::{Fork as PtyFork, Master as PtyMaster};
 use rand::{OsRng, Rng};
 use sslhash::AcceptorBuilder;
-use std::borrow::Cow;
-use std::env;
-use std::io::prelude::*;
-use std::io::{self, ErrorKind as IoErrorKind};
-use std::net::{TcpListener, TcpStream};
-use std::os::unix::io::AsRawFd;
-use std::process::Command;
+use std::{
+    borrow::Cow,
+    env,
+    io::{
+        self,
+        prelude::*,
+        ErrorKind as IoErrorKind
+    },
+    net::{TcpListener, TcpStream},
+    os::unix::io::AsRawFd,
+    process::Command
+};
 use termion::raw::IntoRawMode;
 
 #[cfg(not(feature = "local"))] const ADDR: &str = "0.0.0.0";
