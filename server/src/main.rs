@@ -1,28 +1,29 @@
 extern crate failure;
 extern crate mio;
+extern crate nix;
 extern crate openssl;
-extern crate pty;
 extern crate rand;
 extern crate sslhash;
 extern crate termion;
 
 use failure::Error;
 use mio::{*, unix::EventedFd};
+use nix::pty::{openpty, Winsize};
 use openssl::ssl::{SslAcceptor, SslStream};
-use pty::fork::{Fork as PtyFork, Master as PtyMaster};
 use rand::{OsRng, Rng};
 use sslhash::AcceptorBuilder;
 use std::{
     borrow::Cow,
     env,
+    fs::File,
     io::{
         self,
         prelude::*,
         ErrorKind as IoErrorKind
     },
     net::{TcpListener, TcpStream},
-    os::unix::io::AsRawFd,
-    process::Command
+    os::unix::io::{AsRawFd, FromRawFd},
+    process::{Command, Stdio}
 };
 use termion::raw::IntoRawMode;
 
@@ -30,7 +31,7 @@ use termion::raw::IntoRawMode;
 #[cfg(feature = "local")]      const ADDR: &str = "127.0.0.1";
 const PORT: u16  = 53202;
 
-const BUFSIZE: usize = 512;
+const BUFSIZE: usize = 8 * 1024;
 const PASSLEN: usize = 32;
 
 const TOKEN_STREAM: Token = Token(0);
@@ -89,25 +90,31 @@ fn main() {
         }
     };
 
-    let fork = match PtyFork::from_ptmx() {
-        Ok(fork) => fork,
+    let pty = match openpty(Some(&Winsize {
+        ws_row: 30,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0
+    }), None) {
+        Ok(pty) => pty,
         Err(err) => {
-            eprintln!("failed to fork pty: {}", err);
+            eprintln!("failed to open pseudo-terminal: {}", err);
             return;
         }
     };
 
-    let parent = fork.is_parent();
-    if parent.is_err() {
-        let child = Command::new(&*shell).status();
+    let master = unsafe { File::from_raw_fd(pty.master) };
 
-        if let Err(err) = child {
-            eprintln!("failed to execute command: {}", err);
-        }
-        return;
+    if let Err(err) =
+        Command::new(&*shell)
+            .stdin(unsafe { Stdio::from_raw_fd(pty.slave) })
+            .stdout(unsafe { Stdio::from_raw_fd(pty.slave) })
+            .stderr(unsafe { Stdio::from_raw_fd(pty.slave) })
+            .spawn() {
+        eprintln!("failed to spawn process: {}", err);
     }
 
-    if let Err(err) = main_loop(parent.unwrap(), stream) {
+    if let Err(err) = main_loop(master, stream) {
         eprintln!("{}", err);
     }
 }
@@ -133,7 +140,7 @@ fn connect(listener: &TcpListener, ssl: &SslAcceptor, password: &str) -> Result<
     }
 }
 
-fn main_loop(mut master: PtyMaster, mut stream: SslStream<TcpStream>) -> Result<(), Error> {
+fn main_loop(mut master: File, mut stream: SslStream<TcpStream>) -> Result<(), Error> {
     let mut stdin = io::stdin();
     let stdout = io::stdout().into_raw_mode()?;
     let mut stdout = stdout.lock();

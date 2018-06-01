@@ -12,7 +12,3 @@ Differences:
 # Warning
 
 This is **not** a perfect application. Don't expect it to be one.
-
-Known flaws:
- - Ctrl+C on the server lets fork leak.
- - Does not set window size.

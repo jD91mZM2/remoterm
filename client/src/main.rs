@@ -24,7 +24,7 @@ struct InvalidPassword;
 
 const PORT: u16 = 53202;
 
-const BUFSIZE: usize = 512;
+const BUFSIZE: usize = 8 * 1024;
 const PASSLEN: usize = 32;
 
 const TOKEN_STREAM: Token = Token(0);
