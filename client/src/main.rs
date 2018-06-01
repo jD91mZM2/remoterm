@@ -1,15 +1,16 @@
 #[macro_use] extern crate failure;
+extern crate mio;
 extern crate openssl;
 extern crate sslhash;
 extern crate termion;
 
 use failure::Error;
+use mio::{*, unix::EventedFd};
 use openssl::ssl::{SslConnector, SslMethod};
 use std::io::prelude::*;
 use std::io::{self, ErrorKind as IoErrorKind};
 use std::net::{SocketAddr, TcpStream};
-use std::thread;
-use std::time::Duration;
+use std::os::unix::io::AsRawFd;
 use termion::raw::IntoRawMode;
 
 #[derive(Debug, Fail)]
@@ -20,7 +21,9 @@ const PORT: u16 = 53202;
 
 const BUFSIZE: usize = 512;
 const PASSLEN: usize = 32;
-const DELAY:   usize = 5;
+
+const TOKEN_STREAM: Token = Token(0);
+const TOKEN_STDIN:  Token = Token(1);
 
 fn main() {
     if let Err(err) = inner_main() {
@@ -64,33 +67,46 @@ fn inner_main() -> Result<(), Error> {
 
     stream.get_mut().set_nonblocking(true)?;
 
-    let mut stdout = io::stdout().into_raw_mode()?;
-    stdout.lock();
+    let stdout = io::stdout().into_raw_mode()?;
+    let mut stdout = stdout.lock();
 
-    let mut stdin = termion::async_stdin();
+    let mut stdin = io::stdin();
+
+    let poll = Poll::new()?;
+
+    poll.register(&EventedFd(&stream.get_ref().as_raw_fd()), TOKEN_STREAM, Ready::readable(), PollOpt::edge())?;
+    poll.register(&EventedFd(&stdin.as_raw_fd()), TOKEN_STDIN, Ready::readable(), PollOpt::edge())?;
+
+    let mut events = Events::with_capacity(1024);
+    let mut buf = [0; BUFSIZE];
 
     loop {
-        thread::sleep(Duration::from_millis(DELAY));
+        poll.poll(&mut events, None)?;
+        for event in &events {
+            match event.token() {
+                TOKEN_STREAM => loop {
+                    let read = match stream.read(&mut buf) {
+                        Ok(0) => return Ok(()),
+                        Err(ref err) if err.kind() == IoErrorKind::WouldBlock => break,
+                        x => x?
+                    };
 
-        let mut buf = [0; BUFSIZE];
-        let read = match stream.read(&mut buf) {
-            Err(ref err) if err.kind() == IoErrorKind::WouldBlock => 0,
-            x => x?
-        };
-        if read > 0 {
-            stdout.write_all(&buf[..read]).unwrap();
-            stdout.flush().unwrap();
-        }
+                    stdout.write_all(&buf[..read]).unwrap();
+                    stdout.flush().unwrap();
+                },
+                TOKEN_STDIN => {
+                    // Stdin is blocking, can't loop until WouldBlock.
+                    // Let's hope the bufsize is large enough!
+                    let read = stdin.read(&mut buf)?;
+                    if read == 0 {
+                        return Ok(());
+                    }
 
-        let mut buf = [0; BUFSIZE];
-        let read = match stdin.read(&mut buf) {
-            Err(ref err) if err.kind() == IoErrorKind::WouldBlock => 0,
-            x => x?
-        };
-
-        if read > 0 {
-            stream.write_all(&buf[..read])?;
-            stream.flush()?;
+                    stream.write_all(&buf[..read])?;
+                    stream.flush()?;
+                },
+                _ => unreachable!()
+            }
         }
     }
 }

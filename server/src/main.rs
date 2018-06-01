@@ -1,4 +1,5 @@
 extern crate failure;
+extern crate mio;
 extern crate openssl;
 extern crate pty;
 extern crate rand;
@@ -6,6 +7,7 @@ extern crate sslhash;
 extern crate termion;
 
 use failure::Error;
+use mio::{*, unix::EventedFd};
 use openssl::ssl::{SslAcceptor, SslStream};
 use pty::fork::{Fork as PtyFork, Master as PtyMaster};
 use rand::{OsRng, Rng};
@@ -15,10 +17,8 @@ use std::env;
 use std::io::prelude::*;
 use std::io::{self, ErrorKind as IoErrorKind};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::io::AsRawFd;
 use std::process::Command;
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
 use termion::raw::IntoRawMode;
 
 #[cfg(not(feature = "local"))] const ADDR: &str = "0.0.0.0";
@@ -27,7 +27,10 @@ const PORT: u16  = 53202;
 
 const BUFSIZE: usize = 512;
 const PASSLEN: usize = 32;
-const DELAY:   usize = 5;
+
+const TOKEN_STREAM: Token = Token(0);
+const TOKEN_STDIN:  Token = Token(1);
+const TOKEN_PTY:    Token = Token(2);
 
 fn main() {
     let port = env::args().skip(1).next().map(|arg| arg.parse().unwrap_or_else(|_| {
@@ -125,80 +128,61 @@ fn connect(listener: &TcpListener, ssl: &SslAcceptor, password: &str) -> Result<
     }
 }
 
-struct Defer(mpsc::SyncSender<()>);
-impl Drop for Defer {
-    fn drop(&mut self) {
-        self.0.send(()).unwrap();
-    }
-}
+fn main_loop(mut master: PtyMaster, mut stream: SslStream<TcpStream>) -> Result<(), Error> {
+    let mut stdin = io::stdin();
+    let stdout = io::stdout().into_raw_mode()?;
+    let mut stdout = stdout.lock();
 
-struct ThreadJoin<T>(Option<JoinHandle<T>>);
-impl<T> Drop for ThreadJoin<T> {
-    fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
-            handle.join().unwrap();
-        }
-    }
-}
+    let poll = Poll::new()?;
 
-fn main_loop(mut master: PtyMaster, stream: SslStream<TcpStream>) -> Result<(), Error> {
-    let stream = Arc::new(Mutex::new(stream));
+    poll.register(&EventedFd(&stream.get_ref().as_raw_fd()), TOKEN_STREAM, Ready::readable(), PollOpt::edge())?;
+    poll.register(&EventedFd(&stdin.as_raw_fd()), TOKEN_STDIN, Ready::readable(), PollOpt::edge())?;
+    poll.register(&EventedFd(&master.as_raw_fd()), TOKEN_PTY, Ready::readable(), PollOpt::edge())?;
 
-    let mut master_clone = master.clone();
-    let stream_clone = Arc::clone(&stream);
-
-    let (tx_stop, rx_stop) = mpsc::sync_channel(1);
-
-    let _thread = ThreadJoin(Some(thread::spawn(move || -> Result<(), Error> {
-        let _defer = Defer(tx_stop);
-
-        let mut stdout = io::stdout().into_raw_mode()?;
-        stdout.lock();
-
-        loop {
-            thread::sleep(Duration::from_millis(DELAY));
-
-            let mut buf = [0; BUFSIZE];
-            let read = master_clone.read(&mut buf)?;
-            if read == 0 { return Ok(()); }
-            stdout.write_all(&buf[..read]).unwrap();
-            stdout.flush().unwrap();
-
-            let mut stream = stream_clone.lock().unwrap();
-            stream.write_all(&buf[..read])?;
-            stream.flush()?;
-        }
-    })));
-
-    let mut stdin = termion::async_stdin();
+    let mut events = Events::with_capacity(1024);
+    let mut buf = [0; BUFSIZE];
 
     loop {
-        thread::sleep(Duration::from_millis(DELAY));
+        poll.poll(&mut events, None)?;
 
-        let mut stream = stream.lock().unwrap();
+        for event in &events {
+            match event.token() {
+                TOKEN_STREAM => loop {
+                    let read = match stream.read(&mut buf) {
+                        Ok(0) => return Ok(()),
+                        Err(ref err) if err.kind() == IoErrorKind::WouldBlock => break,
+                        x => x?
+                    };
 
-        let mut buf = [0; BUFSIZE];
-        let read = match stream.read(&mut buf) {
-            Err(ref err) if err.kind() == IoErrorKind::WouldBlock => 0,
-            x => x?
-        };
-        if read > 0 {
-            master.write_all(&buf[..read])?;
-            master.flush()?;
-        }
+                    master.write_all(&buf[..read])?;
+                    master.flush()?;
+                },
+                TOKEN_STDIN => {
+                    // Stdin is blocking, can't loop until WouldBlock.
+                    // Let's hope the bufsize is large enough!
+                    let read = stdin.read(&mut buf)?;
+                    if read == 0 {
+                        return Ok(());
+                    }
 
-        let mut buf = [0; BUFSIZE];
-        let read = match stdin.read(&mut buf) {
-            Err(ref err) if err.kind() == IoErrorKind::WouldBlock => 0,
-            x => x?
-        };
-        if read > 0 {
-            master.write_all(&buf[..read])?;
-            master.flush()?;
-        }
+                    master.write_all(&buf[..read])?;
+                    master.flush()?;
+                },
+                TOKEN_PTY => {
+                    // PTY is blocking, can't loop until WouldBlock.
+                    // Let's hope the bufsize is large enough!
+                    let read = master.read(&mut buf)?;
+                    if read == 0 {
+                        return Ok(());
+                    }
 
-        if rx_stop.try_recv().is_ok() {
-            return Ok(());
+                    stdout.write_all(&buf[..read]).unwrap();
+                    stdout.flush().unwrap();
+                    stream.write_all(&buf[..read])?;
+                    stream.flush()?;
+                },
+                _ => unreachable!()
+            }
         }
     }
 }

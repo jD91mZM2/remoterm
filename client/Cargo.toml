@@ -2,8 +2,10 @@
 authors = ["jD91mZM2 <me@krake.one>"]
 name = "client"
 version = "0.1.0"
+
 [dependencies]
 failure = "0.1.1"
 openssl = "0.10.2"
 sslhash = "0.1.0"
 termion = "1.5.1"
+mio = "0.6.14"
