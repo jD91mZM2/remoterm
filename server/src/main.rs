@@ -153,11 +153,21 @@ fn main_loop(mut master: File, mut stream: SslStream<TcpStream>) -> Result<(), E
 
     let mut events = Events::with_capacity(1024);
     let mut buf = [0; BUFSIZE];
+    let mut todo: Vec<u8> = Vec::with_capacity(1024);
 
     loop {
         poll.poll(&mut events, None)?;
 
         for event in &events {
+            while !todo.is_empty() {
+                let written = match stream.write(&todo) {
+                    Ok(0) => return Ok(()),
+                    Err(ref err) if err.kind() == IoErrorKind::WouldBlock => break,
+                    x => x?
+                };
+                todo.drain(..written);
+            }
+
             match event.token() {
                 TOKEN_STREAM => loop {
                     let read = match stream.read(&mut buf) {
@@ -190,8 +200,19 @@ fn main_loop(mut master: File, mut stream: SslStream<TcpStream>) -> Result<(), E
 
                     stdout.write_all(&buf[..read]).unwrap();
                     stdout.flush().unwrap();
-                    stream.write_all(&buf[..read])?;
+
+                    let mut written = 0;
+                    while written < read {
+                        written += match stream.write(&buf[written..read]) {
+                            Ok(0) => return Ok(()),
+                            Err(ref err) if err.kind() == IoErrorKind::WouldBlock => break,
+                            x => x?
+                        };
+                    }
                     stream.flush()?;
+                    if written < read {
+                        todo.extend(&buf[written..read]);
+                    }
                 },
                 _ => unreachable!()
             }
