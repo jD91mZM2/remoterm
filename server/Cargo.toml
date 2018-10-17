@@ -4,13 +4,14 @@ name = "server"
 version = "0.1.0"
 
 [dependencies]
+common = { path = "../common" }
 failure = "0.1.1"
 mio = "0.6.14"
 openssl = "0.10.2"
+pseudoterm = "0.1.0"
 rand = "0.4.2"
 sslhash = "0.1.0"
 termion = "1.5.1"
-nix = "0.10.0"
 
 [features]
 local = []

@@ -1,18 +1,17 @@
+extern crate common;
 extern crate failure;
 extern crate mio;
-extern crate nix;
 extern crate openssl;
+extern crate pseudoterm;
 extern crate rand;
 extern crate sslhash;
 extern crate termion;
 
+use common::*;
 use failure::Error;
 use mio::{*, unix::EventedFd};
-use nix::{
-    unistd::setsid,
-    pty::{openpty, Winsize}
-};
 use openssl::ssl::{SslAcceptor, SslStream};
+use pseudoterm::{OpenptyOptions, Winsize};
 use rand::{OsRng, Rng};
 use sslhash::AcceptorBuilder;
 use std::{
@@ -21,24 +20,16 @@ use std::{
     fs::File,
     io::{
         self,
-        prelude::*,
-        ErrorKind as IoErrorKind
+        prelude::*
     },
     net::{TcpListener, TcpStream},
-    os::unix::{
-        io::{AsRawFd, FromRawFd},
-        process::CommandExt
-    },
-    process::{Command, Stdio}
+    os::unix::io::AsRawFd,
+    process::Command
 };
 use termion::raw::IntoRawMode;
 
 #[cfg(not(feature = "local"))] const ADDR: &str = "0.0.0.0";
 #[cfg(feature = "local")]      const ADDR: &str = "127.0.0.1";
-const PORT: u16  = 53202;
-
-const BUFSIZE: usize = 8 * 1024;
-const PASSLEN: usize = 32;
 
 const TOKEN_STREAM: Token = Token(0);
 const TOKEN_STDIN:  Token = Token(1);
@@ -96,12 +87,14 @@ fn main() {
         }
     };
 
-    let pty = match openpty(Some(&Winsize {
-        ws_row: 30,
-        ws_col: 80,
-        ws_xpixel: 0,
-        ws_ypixel: 0
-    }), None) {
+    let (master, slave) = match pseudoterm::openpty(
+        &OpenptyOptions::new()
+            .with_nonblocking(true)
+            .with_size(Winsize {
+                cols: 80,
+                rows: 32,
+            })
+    ) {
         Ok(pty) => pty,
         Err(err) => {
             eprintln!("failed to open pseudo-terminal: {}", err);
@@ -109,19 +102,9 @@ fn main() {
         }
     };
 
-    let master = unsafe { File::from_raw_fd(pty.master) };
-
-    if let Err(err) =
-        Command::new(&*shell)
-            .stdin(unsafe { Stdio::from_raw_fd(pty.slave) })
-            .stdout(unsafe { Stdio::from_raw_fd(pty.slave) })
-            .stderr(unsafe { Stdio::from_raw_fd(pty.slave) })
-            .before_exec(|| {
-                setsid().expect("failed to setsid");
-                Ok(())
-            })
-            .spawn() {
+    if let Err(err) = pseudoterm::prepare_cmd(slave, &mut Command::new(&*shell)).and_then(|cmd| cmd.spawn()) {
         eprintln!("failed to spawn process: {}", err);
+        return;
     }
 
     if let Err(err) = main_loop(master, stream) {
@@ -150,82 +133,69 @@ fn connect(listener: &TcpListener, ssl: &SslAcceptor, password: &str) -> Result<
     }
 }
 
-fn main_loop(mut master: File, mut stream: SslStream<TcpStream>) -> Result<(), Error> {
-    let mut stdin = io::stdin();
+fn main_loop(master: File, stream: SslStream<TcpStream>) -> Result<(), Error> {
+    let stdin = MioStdin::new();
     let stdout = io::stdout().into_raw_mode()?;
     let mut stdout = stdout.lock();
 
+    let mut stream = PatientWriter::new(stream);
+    let mut master = PatientWriter::new(master);
+
     let poll = Poll::new()?;
 
-    poll.register(&EventedFd(&stream.get_ref().as_raw_fd()), TOKEN_STREAM, Ready::readable(), PollOpt::edge())?;
-    poll.register(&EventedFd(&stdin.as_raw_fd()), TOKEN_STDIN, Ready::readable(), PollOpt::edge())?;
-    poll.register(&EventedFd(&master.as_raw_fd()), TOKEN_PTY, Ready::readable(), PollOpt::edge())?;
+    poll.register(&EventedFd(&stream.get_ref().as_raw_fd()), TOKEN_STREAM, Ready::readable() | Ready::writable(), PollOpt::edge())?;
+    poll.register(&stdin.reg, TOKEN_STDIN, Ready::readable(), PollOpt::edge())?;
+    poll.register(&EventedFd(&master.as_raw_fd()), TOKEN_PTY, Ready::readable() | Ready::writable(), PollOpt::edge())?;
 
     let mut events = Events::with_capacity(1024);
     let mut buf = [0; BUFSIZE];
-    let mut todo: Vec<u8> = Vec::with_capacity(1024);
 
-    loop {
+    'main: loop {
         poll.poll(&mut events, None)?;
 
         for event in &events {
-            while !todo.is_empty() {
-                let written = match stream.write(&todo) {
-                    Ok(0) => return Ok(()),
-                    Err(ref err) if err.kind() == IoErrorKind::WouldBlock => break,
-                    x => x?
-                };
-                todo.drain(..written);
-            }
-
             match event.token() {
-                TOKEN_STREAM => loop {
-                    let read = match stream.read(&mut buf) {
-                        Ok(0) => return Ok(()),
-                        Err(ref err) if err.kind() == IoErrorKind::WouldBlock => break,
-                        x => x?
-                    };
-
-                    master.write_all(&buf[..read])?;
-                    master.flush()?;
-                },
-                TOKEN_STDIN => {
-                    // Stdin is blocking, can't loop until WouldBlock.
-                    // Let's hope the bufsize is large enough!
-                    let read = stdin.read(&mut buf)?;
-                    if read == 0 {
-                        return Ok(());
+                TOKEN_STREAM => {
+                    if event.readiness().is_writable() {
+                        if stream.write_todo()? {
+                            stream.flush()?;
+                        }
                     }
+                    if event.readiness().is_readable() {
+                        while let Some(read) = maybe(stream.read(&mut buf))? {
+                            if read == 0 { break 'main; }
 
-                    master.write_all(&buf[..read])?;
+                            master.write_all(&buf[..read])?;
+                        }
+                        master.flush()?;
+                    }
+                }
+                TOKEN_STDIN => {
+                    while let Ok(buf) = stdin.rx.try_recv() {
+                        master.write_all(&buf)?;
+                    }
                     master.flush()?;
                 },
                 TOKEN_PTY => {
-                    // PTY is blocking, can't loop until WouldBlock.
-                    // Let's hope the bufsize is large enough!
-                    let read = master.read(&mut buf)?;
-                    if read == 0 {
-                        return Ok(());
+                    if event.readiness().is_writable() {
+                        if stream.write_todo()? {
+                            stream.flush()?;
+                        }
                     }
+                    if event.readiness().is_readable() {
+                        while let Some(read) = maybe(master.read(&mut buf))? {
+                            if read == 0 { break 'main; }
 
-                    stdout.write_all(&buf[..read]).unwrap();
-                    stdout.flush().unwrap();
-
-                    let mut written = 0;
-                    while written < read {
-                        written += match stream.write(&buf[written..read]) {
-                            Ok(0) => return Ok(()),
-                            Err(ref err) if err.kind() == IoErrorKind::WouldBlock => break,
-                            x => x?
-                        };
-                    }
-                    stream.flush()?;
-                    if written < read {
-                        todo.extend(&buf[written..read]);
+                            stdout.write_all(&buf[..read])?;
+                            stream.write_all(&buf[..read])?;
+                        }
+                        stdout.flush()?;
+                        stream.flush()?;
                     }
                 },
-                _ => unreachable!()
+                _ => ()
             }
         }
     }
+    Ok(())
 }

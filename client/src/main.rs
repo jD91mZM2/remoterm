@@ -1,18 +1,16 @@
 #[macro_use] extern crate failure;
+extern crate common;
 extern crate mio;
 extern crate openssl;
 extern crate sslhash;
 extern crate termion;
 
+use common::*;
 use failure::Error;
 use mio::{*, unix::EventedFd};
 use openssl::ssl::{SslConnector, SslMethod};
 use std::{
-    io::{
-        self,
-        prelude::*,
-        ErrorKind as IoErrorKind
-    },
+    io::{self, prelude::*},
     net::{SocketAddr, TcpStream},
     os::unix::io::AsRawFd
 };
@@ -21,11 +19,6 @@ use termion::raw::IntoRawMode;
 #[derive(Debug, Fail)]
 #[fail(display = "invalid password")]
 struct InvalidPassword;
-
-const PORT: u16 = 53202;
-
-const BUFSIZE: usize = 8 * 1024;
-const PASSLEN: usize = 32;
 
 const TOKEN_STREAM: Token = Token(0);
 const TOKEN_STDIN:  Token = Token(1);
@@ -65,7 +58,8 @@ fn inner_main() -> Result<(), Error> {
     let ssl = SslConnector::builder(SslMethod::tls())?.build();
 
     let stream = TcpStream::connect(addr)?;
-    let mut stream = sslhash::connect(&ssl, stream, hash)?;
+    let stream = sslhash::connect(&ssl, stream, hash)?;
+    let mut stream = PatientWriter::new(stream);
 
     stream.write_all(password.as_bytes())?;
     stream.flush()?;
@@ -75,45 +69,48 @@ fn inner_main() -> Result<(), Error> {
     let stdout = io::stdout().into_raw_mode()?;
     let mut stdout = stdout.lock();
 
-    let mut stdin = io::stdin();
+    let stdin = MioStdin::new();
 
     let poll = Poll::new()?;
 
-    poll.register(&EventedFd(&stream.get_ref().as_raw_fd()), TOKEN_STREAM, Ready::readable(), PollOpt::edge())?;
-    poll.register(&EventedFd(&stdin.as_raw_fd()), TOKEN_STDIN, Ready::readable(), PollOpt::edge())?;
+    poll.register(&EventedFd(&stream.get_ref().as_raw_fd()), TOKEN_STREAM, Ready::readable() | Ready::writable(), PollOpt::edge())?;
+    poll.register(&stdin.reg, TOKEN_STDIN, Ready::readable(), PollOpt::edge())?;
 
     let mut events = Events::with_capacity(1024);
     let mut buf = [0; BUFSIZE];
 
-    loop {
+    'main: loop {
         poll.poll(&mut events, None)?;
+
         for event in &events {
             match event.token() {
-                TOKEN_STREAM => loop {
-                    let read = match stream.read(&mut buf) {
-                        Ok(0) => return Ok(()),
-                        Err(ref err) if err.kind() == IoErrorKind::WouldBlock => break,
-                        x => x?
-                    };
+                TOKEN_STREAM => {
+                    if event.readiness().is_writable() {
+                        if stream.write_todo()? {
+                            stream.flush()?;
+                        }
+                    }
+                    if event.readiness().is_readable() {
+                        while let Some(read) = maybe(stream.read(&mut buf))? {
+                            if read == 0 { break 'main; }
 
-                    stdout.write_all(&buf[..read]).unwrap();
-                    stdout.flush().unwrap();
+                            stdout.write_all(&buf[..read])?;
+                        }
+
+                        stdout.flush()?;
+                    }
                 },
                 TOKEN_STDIN => {
-                    // Stdin is blocking, can't loop until WouldBlock.
-                    // Let's hope the bufsize is large enough!
-                    let read = stdin.read(&mut buf)?;
-                    if read == 0 {
-                        return Ok(());
+                    while let Ok(buf) = stdin.rx.try_recv() {
+                        stream.write_all(&buf)?;
                     }
-
-                    stream.write_all(&buf[..read])?;
                     stream.flush()?;
                 },
                 _ => unreachable!()
             }
         }
     }
+    Ok(())
 }
 fn parse_addr(input: &str) -> Option<SocketAddr> {
     let mut parts = input.rsplitn(2, ':');
